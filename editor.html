@@ -993,7 +993,7 @@ async function exportMP4() {
     ffmpeg.FS('writeFile', 'input.mp4', videoData);
     if (exportCancelled) return;
 
-    updateExportProgress(15, 'Preparing subtitle styles...', 'Converting to ASS format');
+    updateExportProgress(15, 'Preparing subtitle styles...', 'Generating subtitle file');
 
     // Step 3: Generate ASS subtitle file with full styling
     const assContent = generateASS();
@@ -1003,14 +1003,48 @@ async function exportMP4() {
     updateExportProgress(20, 'Burning subtitles into video...', 'This is the slow part — please wait');
 
     // Step 4: Run FFmpeg command to burn subtitles
-    await ffmpeg.run(
-      '-i', 'input.mp4',
-      '-vf', 'ass=subs.ass',
-      '-c:a', 'copy',
-      '-preset', 'ultrafast',
-      '-crf', '23',
-      'output.mp4'
-    );
+    // Use force_style with subtitles filter for better FFmpeg.wasm compatibility
+    const s = state.style;
+    const fontSize = Math.round(s.size * 0.85);
+    const primaryColorBGR = hexToBGR(s.textColor);
+    const outlineColorBGR = '00000000';
+    const alignMap = {
+      'top-left': 7, 'top': 8, 'top-right': 9,
+      'middle-left': 4, 'middle': 5, 'middle-right': 6,
+      'bottom-left': 1, 'bottom': 2, 'bottom-right': 3
+    };
+    const alignment = alignMap[s.position] || 2;
+    const outline = s.stroke ? 3 : 1;
+    const bold = s.weight >= 700 ? 1 : 0;
+
+    // Generate SRT format (more compatible than ASS in FFmpeg.wasm)
+    const srtContent = generateSRT();
+    ffmpeg.FS('writeFile', 'subs.srt', new TextEncoder().encode(srtContent));
+
+    // Use subtitles filter with force_style for styling
+    const styleStr = `FontName=Arial,FontSize=${fontSize},PrimaryColour=&H${primaryColorBGR},OutlineColour=&H${outlineColorBGR},Outline=${outline},Bold=${bold},Alignment=${alignment},MarginV=40,BorderStyle=1`;
+
+    try {
+      await ffmpeg.run(
+        '-i', 'input.mp4',
+        '-vf', `subtitles=subs.srt:force_style='${styleStr}'`,
+        '-c:a', 'copy',
+        '-preset', 'ultrafast',
+        '-crf', '23',
+        'output.mp4'
+      );
+    } catch (ffErr) {
+      // Fallback: try without audio copy (for videos without audio)
+      console.log('First attempt failed, trying without audio...', ffErr);
+      try { ffmpeg.FS('unlink', 'output.mp4'); } catch(e) {}
+      await ffmpeg.run(
+        '-i', 'input.mp4',
+        '-vf', `subtitles=subs.srt:force_style='${styleStr}'`,
+        '-preset', 'ultrafast',
+        '-crf', '23',
+        'output.mp4'
+      );
+    }
     if (exportCancelled) return;
 
     updateExportProgress(95, 'Almost done...', 'Preparing download');
@@ -1024,6 +1058,7 @@ async function exportMP4() {
     try {
       ffmpeg.FS('unlink', 'input.mp4');
       ffmpeg.FS('unlink', 'subs.ass');
+      ffmpeg.FS('unlink', 'subs.srt');
       ffmpeg.FS('unlink', 'output.mp4');
     } catch(e) {}
 
@@ -1158,6 +1193,68 @@ ${dialogues.join('\n')}`;
 
 function escapeASS(text) {
   return String(text || '').replace(/\{/g, '\\{').replace(/\}/g, '\\}').replace(/\\n/g, ' ');
+}
+
+// Generate SRT subtitle file (more compatible with FFmpeg.wasm)
+function generateSRT() {
+  // Convert seconds to SRT time format: HH:MM:SS,mmm
+  const fmtSRT = s => {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    const ms = Math.floor((s - Math.floor(s)) * 1000);
+    return [h, m, sec].map(n => String(n).padStart(2, '0')).join(':') + ',' + String(ms).padStart(3, '0');
+  };
+
+  const style = state.style;
+  let srt = '';
+  let counter = 1;
+
+  if (style.mode === 'word') {
+    // Word-by-word: each word is its own subtitle entry
+    state.subtitles.forEach(sub => {
+      const text = String(sub.text || '').trim();
+      if (!text) return;
+      srt += counter + '\n';
+      srt += fmtSRT(sub.start) + ' --> ' + fmtSRT(sub.end) + '\n';
+      srt += text + '\n\n';
+      counter++;
+    });
+  } else {
+    // Line mode: group words within 1.5 sec into one subtitle
+    const lines = [];
+    let current = null;
+    state.subtitles.forEach(sub => {
+      if (!current || sub.start - current.end > 1.5) {
+        if (current) lines.push(current);
+        current = { start: sub.start, end: sub.end, words: [sub.text] };
+      } else {
+        current.end = sub.end;
+        current.words.push(sub.text);
+      }
+    });
+    if (current) lines.push(current);
+
+    lines.forEach(line => {
+      const text = line.words.join(' ').trim();
+      if (!text) return;
+      srt += counter + '\n';
+      srt += fmtSRT(line.start) + ' --> ' + fmtSRT(line.end) + '\n';
+      srt += text + '\n\n';
+      counter++;
+    });
+  }
+
+  return srt;
+}
+
+// Convert hex color (#RRGGBB) to ASS BGR format (BBGGRR)
+function hexToBGR(hex) {
+  const h = String(hex || '#FFFFFF').replace('#', '').padEnd(6, '0');
+  const r = h.substring(0, 2);
+  const g = h.substring(2, 4);
+  const b = h.substring(4, 6);
+  return (b + g + r).toUpperCase();
 }
 
 function showExportModal() {
