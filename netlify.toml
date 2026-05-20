@@ -1,0 +1,12 @@
+[build]
+  functions = "netlify/functions"
+  publish = "."
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Cross-Origin-Embedder-Policy = "require-corp"
+    Cross-Origin-Opener-Policy = "same-origin"
+
+[functions]
+  node_bundler = "esbuild"
